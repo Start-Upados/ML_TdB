@@ -53,12 +53,31 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
 # ============================================================================
+# Helper — converte numpy → tipos Python nativos (pra jsonify não quebrar)
+# ============================================================================
+def _to_native(obj):
+    """
+    Converte recursivamente numpy.int64/float64/etc. → int/float Python.
+    Flask jsonify não serializa tipos numpy.
+    """
+    if hasattr(obj, 'item') and callable(obj.item):
+        return obj.item()
+    if isinstance(obj, dict):
+        return {_to_native(k): _to_native(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_to_native(x) for x in obj]
+    return obj
+
+
+# ============================================================================
 # Carrega o modelo no startup
 # ============================================================================
 try:
     logger.info(f'Carregando modelo de {MODEL_PATH}')
     model = joblib.load(MODEL_PATH)
-    CLASSES = list(getattr(model, 'classes_', []))
+    # _to_native garante que classes (que vêm como numpy.int64 do sklearn)
+    # virem ints Python — senão /health quebra na hora de serializar.
+    CLASSES = _to_native(list(getattr(model, 'classes_', [])))
     MODEL_LOADED = True
     logger.info(f'Modelo carregado. Classes: {CLASSES}')
 except Exception as e:
@@ -201,7 +220,8 @@ def predict():
                 MAPA_CLASSES.get(int(cls), str(cls)): round(float(p), 4)
                 for cls, p in zip(CLASSES, proba)
             }
-        return jsonify(result), 200
+        # _to_native blinda contra qualquer numpy type residual
+        return jsonify(_to_native(result)), 200
     except Exception as e:
         logger.exception('Erro na predição')
         return jsonify({
