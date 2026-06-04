@@ -52,6 +52,9 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
+from flask_cors import CORS
+CORS(app)  # libera todas as origens; pra prod, restringe com origins=[...]
+
 # ============================================================================
 # Helper — converte numpy → tipos Python nativos (pra jsonify não quebrar)
 # ============================================================================
