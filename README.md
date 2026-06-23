@@ -22,6 +22,7 @@
 ## 📑 Sumário
 
 - [Sobre o Projeto](#-sobre-o-projeto)
+- [📸 Integração em Produção](#-integração-em-produção)
 - [O Problema](#-o-problema)
 - [Arquitetura](#-arquitetura)
 - [Pontos Altos do Projeto](#-pontos-altos-do-projeto)
