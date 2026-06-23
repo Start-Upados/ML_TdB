@@ -52,8 +52,26 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
+# ============================================================================
+# CORS — só aceita origens conhecidas
+# ============================================================================
+# Origens permitidas vêm da variável de ambiente CORS_ALLOWED_ORIGINS
+# (separadas por vírgula). Em dev/local, default permite localhost.
+# Em produção, configure no Render:
+#   CORS_ALLOWED_ORIGINS=https://www.startupados.com.br,https://startupados.com.br
 from flask_cors import CORS
-CORS(app)  # libera todas as origens; pra prod, restringe com origins=[...]
+
+_default_origins = 'http://localhost:5173,http://localhost:3000'
+_origins_env = os.environ.get('CORS_ALLOWED_ORIGINS', _default_origins)
+ALLOWED_ORIGINS = [o.strip() for o in _origins_env.split(',') if o.strip()]
+
+CORS(
+    app,
+    resources={r'/*': {'origins': ALLOWED_ORIGINS}},
+    methods=['GET', 'POST', 'OPTIONS'],
+    allow_headers=['Content-Type'],
+)
+logger.info(f'CORS habilitado para origens: {ALLOWED_ORIGINS}')
 
 # ============================================================================
 # Helper — converte numpy → tipos Python nativos (pra jsonify não quebrar)
