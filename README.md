@@ -38,6 +38,30 @@
 
 ---
 
+---
+
+## 📸 Integração em Produção
+
+A API está integrada à plataforma da Turma do Bem, classificando solicitações em tempo real assim que chegam pelo formulário público. A interface mostra a classificação, a confiança do modelo e os fatores principais que levaram à decisão — permitindo ao operador entender e, se necessário, reclassificar.
+
+<div align="center">
+
+![Central de canais com classificação ML em tempo real](docs1/screenshots/central-canais.png)
+
+</div>
+
+**O que essa tela demonstra:**
+
+- 🎯 **Classificação automática** com nível de confiança visível (ex.: 70%)
+- 🧠 **Explicabilidade da decisão** — os fatores que pesaram (idade, programa, canal, dano)
+- 🔄 **Reclassificação manual** disponível quando o operador discorda do modelo
+- ✅ **Fluxo de aprovação humana** preservado (Aprovar / Recusar / Responder)
+- 📊 **Inbox priorizado** — solicitações ALTA aparecem com destaque visual
+
+> Esse fluxo materializa um princípio central do projeto: **ML como assistente, não como decisor final**. O modelo sugere e justifica; o humano valida e aplica.
+
+---
+
 ## 🎯 Sobre o Projeto
 
 **ML_TdB** é uma API REST que serve um modelo de classificação treinado para priorizar automaticamente solicitações de atendimento da ONG **Turma do Bem**, que oferece tratamento odontológico gratuito para dois públicos em vulnerabilidade:
