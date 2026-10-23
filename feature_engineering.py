@@ -1,151 +1,93 @@
 """
-feature_engineering.py
-======================
-Engenharia de features, vocabulário e normalização para o classificador
-de prioridade da ONG Turma do Bem.
+feature_engineering.py — v2
+===========================
+Transforma o caso canônico (regras.Caso) nas colunas numéricas do modelo.
 
-Aplicado server-side em cada request — o cliente só precisa mandar os 9
-campos brutos do schema. Este módulo calcula as 12 features derivadas
-que o modelo espera (totalizando 21 colunas).
+O modelo NÃO recebe a pontuação final das regras (senão ele só aprenderia um
+"if pontos >= 60"). Ele recebe os fatores crus + o sinal de regra crítica, e
+aprende sozinho como combiná-los a partir do dataset rotulado.
 
-IMPORTANTE: as fórmulas abaixo precisam ser IDÊNTICAS às usadas no notebook
-de treino. Se o notebook usou valores ou conjunções diferentes, ajustar aqui.
+Também converte o payload antigo (v1, 9 campos) para o formato novo, para o
+front antigo continuar funcionando enquanto o novo não sobe.
 """
+from __future__ import annotations
+
 import pandas as pd
 
+from regras import (
+    Caso, avaliar, montar_caso,
+    NECESSIDADES, ENCAMINHAMENTOS, IDADE_MIN_JOVEM, IDADE_MAX_JOVEM,
+)
+
+ORD_RENDA = {'acima_3': 0, '2_a_3': 1, '1_a_2': 2, 'ate_1': 3, 'nao_informada': 1.5}
+ORD_VITIMA = {'nao': 0, 'nao_informado': 1, 'sim': 2}
+ORD_SINTOMA = {'nenhum': 0, 'leve': 1, 'moderado': 2, 'grave': 3}
+
+FEATURES = (
+    ['apolonias', 'idade', 'renda_ord', 'renda_nao_informada', 'vitima_ord', 'sintoma_ord',
+     'tempo_espera', 'impacto_social', 'urgencia', 'fora_faixa_programa', 'regra_critica']
+    + [f'nec_{n}' for n in NECESSIDADES]
+    + [f'enc_{e}' for e in ENCAMINHAMENTOS]
+)
+
+
+def caso_para_linha(c: Caso, regra_critica: bool | None = None) -> dict:
+    if regra_critica is None:
+        regra_critica = avaliar(c).regra_critica is not None
+    apo = c.programa == 'apolonias_do_bem'
+    fora = (not apo and not (IDADE_MIN_JOVEM <= c.idade <= IDADE_MAX_JOVEM)) or (apo and c.vitima == 'nao')
+    linha = {
+        'apolonias': int(apo),
+        'idade': c.idade,
+        'renda_ord': ORD_RENDA[c.renda],
+        'renda_nao_informada': int(c.renda == 'nao_informada'),
+        'vitima_ord': ORD_VITIMA[c.vitima],
+        'sintoma_ord': ORD_SINTOMA[c.sintoma],
+        'tempo_espera': min(c.tempo_espera, 365),
+        'impacto_social': int(c.impacto_social),
+        'urgencia': int(c.urgencia),
+        'fora_faixa_programa': int(fora),
+        'regra_critica': int(regra_critica),
+    }
+    for n in NECESSIDADES:
+        linha[f'nec_{n}'] = int(c.necessidade == n)
+    for e in ENCAMINHAMENTOS:
+        linha[f'enc_{e}'] = int(c.encaminhamento == e)
+    return linha
+
+
+def casos_para_df(casos: list[Caso]) -> pd.DataFrame:
+    return pd.DataFrame([caso_para_linha(c) for c in casos], columns=FEATURES)
+
 
 # ============================================================================
-# Vocabulário — valores válidos de cada campo categórico
+# Compatibilidade com o payload v1 (front antigo)
 # ============================================================================
-VOCAB = {
-    'programa': ['apolonas_do_bem', 'dentista_do_bem'],
-    'sexo': ['feminino', 'masculino'],
-    'tipo_pedido': ['consulta', 'emergencia'],
-    'tipo_violencia': ['nenhuma', 'leve', 'grave'],
-    'vulnerabilidade': ['baixa', 'media', 'alta'],
-    'dano_dentario': ['nenhum', 'leve', 'moderado', 'grave'],
-    'tipo_tratamento': ['canal', 'extracao', 'restauracao', 'limpeza'],
-}
-
-# Campos obrigatórios no payload de /predict
-REQUIRED_FIELDS = [
-    'programa', 'tempo_espera', 'sexo', 'idade', 'tipo_violencia',
-    'vulnerabilidade', 'dano_dentario', 'tipo_pedido', 'tipo_tratamento',
-]
-
-# Aliases aceitos — normalizados antes da validação de vocabulário
-ALIASES = {
-    'sexo': {
-        'f': 'feminino', 'F': 'feminino', 'fem': 'feminino', 'feminina': 'feminino',
-        'm': 'masculino', 'M': 'masculino', 'masc': 'masculino',
-    },
-    'programa': {
-        'apolonias_do_bem': 'apolonas_do_bem',
-        'apolonia_do_bem': 'apolonas_do_bem',
-        'Apolonias do Bem': 'apolonas_do_bem',
-        'apoio_social': 'apolonas_do_bem',  # nome interno antigo do frontend
-        'Apoio Social': 'apolonas_do_bem',
-        'dentista': 'dentista_do_bem',
-        'Dentista do Bem': 'dentista_do_bem',
-    },
-    'tipo_pedido': {
-        'urgente': 'emergencia',
-        'urgencia': 'emergencia',
-        'Urgente': 'emergencia',
-    },
-}
-
-# ============================================================================
-# Mapas ordinais — codificam ordem natural de severidade
-# ============================================================================
-MAPA_DANO = {'nenhum': 0, 'leve': 1, 'moderado': 2, 'grave': 3}
-MAPA_VIOLENCIA = {'nenhuma': 0, 'leve': 1, 'grave': 2}
-MAPA_VULNERABILIDADE = {'baixa': 0, 'media': 1, 'alta': 2}
+CAMPOS_V1 = ['programa', 'tempo_espera', 'sexo', 'idade', 'tipo_violencia',
+             'vulnerabilidade', 'dano_dentario', 'tipo_pedido', 'tipo_tratamento']
 
 
-def normalize_input(payload: dict) -> dict:
-    """Aplica aliases (F → feminino, urgente → emergencia, etc.)."""
-    out = dict(payload)
-    for campo, mapa in ALIASES.items():
-        if campo in out and out[campo] in mapa:
-            out[campo] = mapa[out[campo]]
-    return out
+def eh_payload_v1(p: dict) -> bool:
+    return 'vulnerabilidade' in p and 'renda_familiar' not in p
 
 
-def add_business_features(X: pd.DataFrame) -> pd.DataFrame:
-    """
-    Recebe DataFrame com os 9 campos brutos e devolve com as 12 features
-    derivadas adicionadas (total = 21 colunas).
+def v1_para_v2(p: dict) -> dict:
+    renda = {'alta': 'ate_1', 'media': '1_a_2', 'baixa': '2_a_3'}.get(str(p.get('vulnerabilidade', '')).lower(), 'nao_informada')
+    vit = {'grave': 'sim', 'leve': 'sim'}.get(str(p.get('tipo_violencia', '')).lower(), 'nao_informado')
+    sintoma = {'grave': 'grave', 'moderado': 'moderado', 'leve': 'leve'}.get(str(p.get('dano_dentario', '')).lower(), 'nenhum')
+    if str(p.get('tipo_pedido', '')).lower() in ('emergencia', 'urgente') and sintoma in ('nenhum', 'leve'):
+        sintoma = 'moderado'
+    return {
+        'programa': p.get('programa'),
+        'idade': p.get('idade'),
+        'sexo': p.get('sexo'),
+        'renda_familiar': renda,
+        'necessidade': p.get('tipo_tratamento'),
+        'vitima_violencia': vit,
+        'sintoma': sintoma,
+        'tempo_espera': p.get('tempo_espera', 0),
+        'texto': '',
+    }
 
-    Features derivadas:
-      Scores ordinais:
-        - dano_score, violencia_score, vulnerabilidade_score, risco_total
-      Flags de idade:
-        - idade_50_mais, idade_jovem_alvo
-      Conjunções de ALTA — Apolônias do Bem (mulheres):
-        - apo_dano_grave_viol_grave
-        - apo_dano_grave_idade_50
-        - apo_moderado_viol_grave_45
-      Conjunções de ALTA — Dentista do Bem (jovens 11-17):
-        - dent_vuln_alta_canal_extr
-        - dent_vuln_alta_rest_espera_20
-      Agregado:
-        - regra_alta_acionada
-    """
-    df = X.copy()
 
-    # ---------- Scores ordinais ----------
-    df['dano_score'] = df['dano_dentario'].map(MAPA_DANO).astype(int)
-    df['violencia_score'] = df['tipo_violencia'].map(MAPA_VIOLENCIA).astype(int)
-    df['vulnerabilidade_score'] = df['vulnerabilidade'].map(MAPA_VULNERABILIDADE).astype(int)
-    df['risco_total'] = (
-        df['dano_score'] + df['violencia_score'] + df['vulnerabilidade_score']
-    )
-
-    # ---------- Flags de idade ----------
-    df['idade_50_mais'] = (df['idade'] >= 50).astype(int)
-    df['idade_jovem_alvo'] = ((df['idade'] >= 11) & (df['idade'] <= 17)).astype(int)
-
-    # ---------- Apolônias do Bem ----------
-    is_apo = (df['programa'] == 'apolonas_do_bem')
-    df['apo_dano_grave_viol_grave'] = (
-        is_apo
-        & (df['dano_dentario'] == 'grave')
-        & (df['tipo_violencia'] == 'grave')
-    ).astype(int)
-    df['apo_dano_grave_idade_50'] = (
-        is_apo
-        & (df['dano_dentario'] == 'grave')
-        & (df['idade'] >= 50)
-    ).astype(int)
-    df['apo_moderado_viol_grave_45'] = (
-        is_apo
-        & (df['dano_dentario'] == 'moderado')
-        & (df['tipo_violencia'] == 'grave')
-        & (df['idade'] >= 45)
-    ).astype(int)
-
-    # ---------- Dentista do Bem ----------
-    is_dent = (df['programa'] == 'dentista_do_bem')
-    df['dent_vuln_alta_canal_extr'] = (
-        is_dent
-        & (df['vulnerabilidade'] == 'alta')
-        & (df['tipo_tratamento'].isin(['canal', 'extracao']))
-    ).astype(int)
-    df['dent_vuln_alta_rest_espera_20'] = (
-        is_dent
-        & (df['vulnerabilidade'] == 'alta')
-        & (df['tipo_tratamento'] == 'restauracao')
-        & (df['tempo_espera'] > 20)
-    ).astype(int)
-
-    # ---------- Agregado ----------
-    df['regra_alta_acionada'] = df[[
-        'apo_dano_grave_viol_grave',
-        'apo_dano_grave_idade_50',
-        'apo_moderado_viol_grave_45',
-        'dent_vuln_alta_canal_extr',
-        'dent_vuln_alta_rest_espera_20',
-    ]].sum(axis=1)
-
-    return df
+__all__ = ['FEATURES', 'caso_para_linha', 'casos_para_df', 'eh_payload_v1', 'v1_para_v2', 'montar_caso', 'CAMPOS_V1']

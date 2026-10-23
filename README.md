@@ -70,7 +70,7 @@ A API está integrada à plataforma da Turma do Bem, classificando solicitaçõe
 - **Dentista do Bem** — jovens de 11 a 17 anos em vulnerabilidade social
 - **Apolônias do Bem** — mulheres vítimas de violência com dentição afetada
 
-O modelo recebe **9 campos brutos** do solicitante (idade, sexo, programa, tipo de dano, vulnerabilidade, etc.) e retorna a prioridade classificada — ajudando a ONG a alocar recursos onde o impacto é maior.
+O modelo recebe os dados do formulário (idade, programa, renda familiar, necessidade, como soube, tempo na fila e a descrição livre) e retorna a prioridade, a confiança e os fatores que pesaram — ajudando a ONG a alocar recursos onde o impacto é maior.
 
 > Esse projeto integra a plataforma maior **[Turma do Bem (StartUpados)](https://github.com/Start-Upados/Front_TdB)**, atendendo às solicitações recebidas pelo formulário público em [startupados.com.br](https://www.startupados.com.br/).
 
@@ -93,29 +93,30 @@ A solução automatiza essa decisão usando dados históricos da ONG e codifica 
 
 ```mermaid
 flowchart LR
-    FE["⚛️ Frontend<br/>(Plataforma TdB)"] -->|9 campos brutos<br/>via POST /predict| API["🐍 Flask API<br/>(este projeto)"]
-    API -->|normaliza aliases<br/>valida vocabulário| Norm["🧹 normalize_input<br/>+ VOCAB check"]
-    Norm -->|gera 12 features derivadas| FE_ENG["⚙️ feature_engineering<br/>add_business_features"]
-    FE_ENG -->|21 colunas finais| Model[("🧠 modelo_ong_prioridade<br/>.joblib")]
-    Model -->|predição + probabilidades| API
-    API -->|JSON com prediction<br/>+ probabilities| FE
+    FE["⚛️ Frontend<br/>(Plataforma TdB)"] -->|dados do formulário<br/>+ descrição livre| API["🐍 Flask API<br/>(este projeto)"]
+    API --> R["📏 regras.py<br/>normaliza, lê o texto,<br/>pontua e checa regras críticas"]
+    R --> F["⚙️ feature_engineering<br/>caso → colunas do modelo"]
+    F --> Model[("🧠 modelo_ong_prioridade<br/>.joblib")]
+    Model -->|probabilidades| API
+    R -->|pontuação, fatores, alertas| API
+    API -->|prioridade + confiança<br/>+ explicação| FE
 ```
 
 **Fluxo de uma requisição:**
 
-1. Cliente envia 9 campos brutos via `POST /predict`
-2. Aliases são normalizados (`F` → `feminino`, `urgente` → `emergencia`)
-3. Campos validados contra vocabulário fechado e tipos esperados
-4. Feature engineering **server-side** gera 12 features derivadas
-5. Modelo (joblib) prediz a classe + probabilidades
-6. Resposta JSON com `prediction` e `probabilities`
+1. O front envia os dados do formulário via `POST /predict` (o payload antigo de 9 campos também é aceito)
+2. `regras.py` normaliza os textos do formulário e lê a descrição (sintomas, urgência, violência, impacto)
+3. Calcula a pontuação (0–100) e verifica as regras críticas
+4. O modelo prevê a faixa a partir dos fatores, com probabilidade calibrada
+5. Decisão: regra crítica → ALTA; senão, a classe do modelo; fora do perfil nunca vira ALTA
+6. Resposta com `prediction`, `confianca`, `pontuacao`, `fatores`, `regra_critica` e `alertas`
 
 ---
 
 ## ⭐ Pontos Altos do Projeto
 
-### 🧠 Feature Engineering Server-Side
-O cliente envia apenas **9 campos brutos**. O servidor calcula **12 features derivadas** (scores ordinais, flags de idade, conjunções de regras de domínio). Resultado: o frontend não precisa duplicar a lógica de negócio — é o padrão correto de API ML profissional, com a complexidade do modelo isolada do consumidor.
+### 🧠 Regras e leitura do texto no servidor
+O cliente envia os dados do formulário como estão. Toda a lógica de negócio (normalização, leitura da descrição, pontuação, regras críticas) fica em `regras.py`, num lugar só, e cada decisão volta explicada.
 
 ### 📦 Pipeline Portável (joblib + módulo separado)
 O `feature_engineering.py` foi deliberadamente isolado em módulo próprio, **não inline no notebook**. Isso resolve um problema clássico: modelos serializados com `joblib` quebram quando as funções customizadas não estão importáveis no servidor. A estrutura atual garante que o `.joblib` carrega corretamente em qualquer ambiente que tenha esse módulo no path.
@@ -143,61 +144,69 @@ As origens permitidas são controladas pela variável de ambiente `CORS_ALLOWED_
 
 ---
 
-## 🧪 O Modelo
+## 🧪 O Modelo (v2)
 
-### Dataset
-- **Registros:** 2.638 amostras (após remoção de 9 duplicatas)
-- **Origem:** dados históricos da ONG Turma do Bem, anonimizados
-- **Distribuição de classes:**
+### Por que a v2
+Na v1, quase toda solicitação saía **BAIXA com 71–73% de confiança** e nenhum jovem chegava a ALTA. Dois motivos:
+1. O front montava os 9 campos a partir de palavras-chave do texto e mandava quase sempre os mesmos valores
+   (`vulnerabilidade: media`, `dano: leve`, `tempo_espera: 1`). A **renda familiar** e a **necessidade** do formulário nunca chegavam ao modelo.
+2. Para o Dentista do Bem, o único caminho até ALTA exigia `vulnerabilidade: alta`, que o front praticamente nunca enviava. A idade não mudava nada.
 
-| Prioridade | Quantidade | Percentual |
-|---|---|---|
-| BAIXA | 1.151 | 44% |
-| MÉDIA | 937 | 35% |
-| ALTA | 550 | 21% |
+### Como funciona agora
+1. **Entrada com os dados reais do formulário:** renda, necessidade, idade, como soube, dias na fila e a descrição livre.
+2. **Leitura da descrição** (`regras.py`): sintomas (com negação: “sem dor” não conta), sinais de urgência, relato de violência e impacto social.
+3. **Pontuação de 0 a 100** pelo critério da ONG, com o motivo de cada ponto.
+4. **Modelo de ML** (HistGradientBoosting com probabilidades calibradas) decide a faixa a partir dos fatores, treinado em um dataset rotulado pelo critério (`treinar.py`).
+5. **Regras críticas** levam direto para ALTA, e quem está fora do perfil do programa nunca sobe para ALTA (exceto urgência clínica).
 
-### Features
+### Métricas (teste, 2.400 casos)
+| Métrica | Valor |
+|---|---|
+| Acurácia vs critério da ONG | **93,2%** |
+| Precisão / recall de ALTA | 97% / 93% |
+| Distribuição prevista | ALTA 29% · MÉDIA 48% · BAIXA 23% |
+| Confiança | mediana 0,91; cai para ~0,6 em casos de fronteira |
 
-**9 campos brutos (entrada):**
-
-| Campo | Tipo | Valores válidos |
-|---|---|---|
-| `programa` | categórico | `apolonas_do_bem`, `dentista_do_bem` |
-| `tempo_espera` | inteiro | dias desde a solicitação |
-| `sexo` | categórico | `feminino`, `masculino` |
-| `idade` | inteiro | anos |
-| `tipo_violencia` | categórico | `nenhuma`, `leve`, `grave` |
-| `vulnerabilidade` | categórico | `baixa`, `media`, `alta` |
-| `dano_dentario` | categórico | `nenhum`, `leve`, `moderado`, `grave` |
-| `tipo_pedido` | categórico | `consulta`, `emergencia` |
-| `tipo_tratamento` | categórico | `canal`, `extracao`, `restauracao`, `limpeza` |
-
-**12 features derivadas (geradas server-side):**
-- **Scores ordinais:** `dano_score`, `violencia_score`, `vulnerabilidade_score`, `risco_total`
-- **Flags de idade:** `idade_50_mais`, `idade_jovem_alvo`
-- **Conjunções de ALTA (Apolônias):** 3 features de combinações críticas
-- **Conjunções de ALTA (Dentista do Bem):** 2 features de combinações críticas
-- **Agregado:** `regra_alta_acionada` (soma das conjunções acionadas)
-
-### Algoritmo
-Modelo baseado em **árvores de decisão** (scikit-learn 1.6.1) treinado com `class_weight='balanced'` para compensar o desbalanceamento entre classes (BAIXA é 2x mais frequente que ALTA).
+> O dataset é **sintético**, gerado com distribuições parecidas com o público de cada programa e rotulado pelo critério.
+> Perto dos limites de faixa, parte dos rótulos é sorteada para a faixa vizinha (simula a discordância entre avaliadores).
+> Assim que houver decisões reais da equipe, retreine com `python treinar.py --reais casos.csv` (esses casos pesam 5x).
 
 ---
 
-## 🚨 Regras de Domínio
+## 🚨 Regras de Domínio (v2)
 
-O modelo foi treinado considerando regras de negócio críticas codificadas como features. Essas regras refletem o conhecimento clínico e social acumulado pela ONG:
-
-### Apolônias do Bem (mulheres)
-- 🔴 **ALTA** → dano grave + violência grave
-- 🔴 **ALTA** → dano grave + idade ≥ 50
-- 🔴 **ALTA** → dano moderado + violência grave + idade ≥ 45
+Faixas: **ALTA ≥ 65 pontos · MÉDIA 40–64 · BAIXA < 40**
 
 ### Dentista do Bem (jovens 11–17)
-- 🔴 **ALTA** → vulnerabilidade alta + tratamento de canal ou extração
-- 🔴 **ALTA** → vulnerabilidade alta + restauração + tempo de espera > 20 dias
+| Fator | Pontos |
+|---|---|
+| Renda até 1 SM / 1–2 SM / 2–3 SM / acima de 3 SM / não informada | 30 / 20 / 8 / 0 / 12 |
+| Idade 17 / 16 / 15 / 14 / 11–13 (janela até os 18) | 15 / 12 / 8 / 5 / 3 |
+| Necessidade canal / extração / restauração / outro / ortodontia / limpeza | 25 / 22 / 14 / 8 / 6 / 3 |
+| Sintoma grave / moderado / leve (lido da descrição) | 25 / 12 / 3 |
+| Tempo na fila | +2 por semana (máx. 15) |
+| Encaminhado por posto/escola / rede de proteção | 4 / 8 |
+| Relato de violência · impacto social (escola, autoestima) | 10 · 5 |
 
-Essas regras viram **features binárias** no pipeline, dando ao modelo "atalhos" treinados em vez de depender só de combinações descobertas pelas árvores.
+**ALTA direto:** renda até 1 SM + canal/extração · 17 anos + renda até 2 SM + canal/extração/restauração ·
+baixa renda + dor + canal/extração · adolescente com relato de violência.
+
+### Apolônias do Bem (mulheres)
+| Fator | Pontos |
+|---|---|
+| Vítima de violência com dentição afetada / não informado / não | 40 / 15 / 0 |
+| Idade < 18 / 60+ / 50–59 / 40–49 | 12 / 10 / 8 / 4 |
+| Sintoma grave / moderado / leve | 25 / 12 / 3 |
+| Encaminhada por Delegacia/CREAS · posto de saúde | 10 · 4 |
+| Necessidade canal/extração · restauração | 15 · 8 |
+| Tempo na fila · impacto social | +2/semana (máx. 15) · 5 |
+
+**ALTA direto:** menor vítima de violência · vítima com dano grave (dente quebrado/perdido, dor forte) ·
+vítima encaminhada por Delegacia/CREAS com dor.
+
+### Os dois programas
+- **Urgência clínica → ALTA:** abscesso, pus, inchaço, febre, sangramento, infecção, dor que impede comer/dormir.
+- **Fora do perfil** (jovem fora de 11–17, mulher sem relato de violência) → alerta para conferir a elegibilidade, sem ALTA.
 
 ---
 
@@ -243,20 +252,20 @@ Documenta o contrato da API — útil para frontend e debug.
 ```
 
 ### `POST /predict`
-Classifica uma solicitação.
+Classifica uma solicitação. Aceita os textos do formulário do site como estão.
+O payload antigo (v1, 9 campos) continua aceito.
 
 **Request:**
 ```json
 {
-  "programa": "apolonas_do_bem",
-  "tempo_espera": 30,
-  "sexo": "feminino",
-  "idade": 70,
-  "tipo_violencia": "grave",
-  "vulnerabilidade": "alta",
-  "dano_dentario": "grave",
-  "tipo_pedido": "emergencia",
-  "tipo_tratamento": "canal"
+  "programa": "Dentista do Bem",
+  "idade": 15,
+  "sexo": "masculino",
+  "renda_familiar": "Ate 1 salario minimo",
+  "necessidade": "Restauracao",
+  "como_soube": "Escola",
+  "texto": "Sente dor no dente faz 3 semanas",
+  "tempo_espera": 21
 }
 ```
 
@@ -264,24 +273,19 @@ Classifica uma solicitação.
 ```json
 {
   "prediction": "ALTA",
-  "probabilities": {
-    "ALTA": 0.8745,
-    "BAIXA": 0.0312,
-    "MEDIA": 0.0943
-  }
-}
-```
-
-**Response (400) — entrada inválida:**
-```json
-{
-  "error": "Valores inválidos",
-  "invalid": {
-    "tipo_violencia": {
-      "received": "extrema",
-      "allowed": ["nenhuma", "leve", "grave"]
-    }
-  }
+  "confianca": 0.65,
+  "probabilities": { "ALTA": 0.65, "MEDIA": 0.35, "BAIXA": 0.0 },
+  "origem": "modelo",
+  "pontuacao": 74,
+  "prioridade_criterio": "ALTA",
+  "regra_critica": null,
+  "fatores": [
+    { "fator": "Renda: até 1 salário mínimo", "pontos": 30 },
+    { "fator": "Necessidade: restauração", "pontos": 14 },
+    { "fator": "Sintoma moderado (\"dor\")", "pontos": 12 }
+  ],
+  "alertas": [],
+  "modelo_versao": "ml-tdb-v2"
 }
 ```
 
@@ -291,15 +295,13 @@ Classifica uma solicitação.
 curl -X POST https://ml-tdb.onrender.com/predict \
   -H "Content-Type: application/json" \
   -d '{
-    "programa": "apolonas_do_bem",
-    "tempo_espera": 30,
+    "programa": "Apolônias do Bem",
+    "idade": 42,
     "sexo": "feminino",
-    "idade": 70,
-    "tipo_violencia": "grave",
-    "vulnerabilidade": "alta",
-    "dano_dentario": "grave",
-    "tipo_pedido": "emergencia",
-    "tipo_tratamento": "canal"
+    "necessidade": "Vitima de violencia com denticao afetada",
+    "como_soube": "Delegacia/CREAS",
+    "texto": "Perdi dois dentes depois de uma agressão",
+    "tempo_espera": 3
   }'
 ```
 
@@ -316,13 +318,15 @@ curl https://ml-tdb.onrender.com/schema
 
 ```
 ML_TdB/
-├── app.py                          # API Flask (endpoints + handlers)
-├── feature_engineering.py          # Vocab + aliases + features derivadas
-├── modelo_ong_prioridade.joblib    # Modelo treinado serializado
-├── requirements.txt                # Dependências
-├── .gitignore                      # Proteção contra artefatos locais
-├── LICENSE                         # MIT
-└── README.md                       # Este arquivo
+├── app.py                          # API Flask (endpoints + decisão final)
+├── regras.py                       # Critério da ONG: normalização, leitura do texto, pontuação, regras críticas
+├── feature_engineering.py          # Caso → colunas do modelo + compatibilidade com payload v1
+├── treinar.py                      # Gera o dataset, treina e mede o modelo
+├── modelo_ong_prioridade.joblib    # Modelo treinado (v2)
+├── modelo_ong_prioridade.metricas.json
+├── requirements.txt
+├── LICENSE
+└── README.md
 ```
 
 ---
@@ -392,7 +396,9 @@ gunicorn app:app
 - [x] Deploy em produção no Render
 - [x] Integração com a plataforma Turma do Bem
 - [x] **CORS restrito** a origens conhecidas via variável de ambiente
-- [ ] Endpoint `/explain` retornando _feature importance_ por predição
+- [x] Explicação por predição (`fatores`, `regra_critica`, `alertas`) — v2
+- [x] Uso dos dados reais do formulário (renda, necessidade, tempo na fila) — v2
+- [ ] Retreino com as decisões reais da equipe (`treinar.py --reais`)
 - [ ] Métricas de uso (Prometheus / observabilidade)
 - [ ] Versionamento do modelo via `/predict?v=1.2`
 - [ ] Pipeline de retraining automatizado

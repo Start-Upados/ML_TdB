@@ -1,0 +1,14 @@
+{
+  "versao": "ml-tdb-v2",
+  "treinado_em": "2026-10-22",
+  "n_treino": 9600,
+  "n_teste": 2400,
+  "acuracia_vs_criterio": 0.9321,
+  "acuracia_vs_rotulo": 0.8688,
+  "distribuicao_prevista": {
+    "ALTA": 0.2879,
+    "MEDIA": 0.4842,
+    "BAIXA": 0.2279
+  },
+  "casos_reais": 0
+}

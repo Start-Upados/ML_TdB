@@ -1,115 +1,67 @@
 """
-app.py — API REST para o classificador de prioridade da ONG Turma do Bem.
+app.py — API REST do classificador de prioridade da Turma do Bem (v2)
 
 Endpoints:
-    GET  /health   — status do serviço
-    GET  /schema   — valores válidos de cada campo + exemplo
-    POST /predict  — recebe JSON com 9 campos brutos, retorna prioridade
+    GET  /health   — status do serviço e métricas do modelo
+    GET  /schema   — contrato de entrada + exemplos
+    POST /predict  — classifica uma solicitação (aceita payload v2 e o antigo v1)
 
-Como rodar:
-    python app.py
-
-Requisitos no mesmo diretório:
-    - model_pipeline.joblib
-    - feature_engineering.py
+Decisão final:
+    1. Regra crítica acionada (regras.py)  -> ALTA
+    2. Caso contrário                      -> classe prevista pelo modelo
+    3. Fora do perfil do programa          -> nunca ALTA (salvo urgência clínica)
 """
 import os
 import logging
 import traceback
+from dataclasses import asdict
 from pathlib import Path
 
 import joblib
 import pandas as pd
 from flask import Flask, request, jsonify
+from flask_cors import CORS
 
-from feature_engineering import (
-    add_business_features,
-    normalize_input,
-    REQUIRED_FIELDS,
-    VOCAB,
-    ALIASES,
+from regras import (
+    montar_caso, avaliar, RENDAS, NECESSIDADES, VITIMA, SINTOMAS,
+    LIMIAR_ALTA, LIMIAR_MEDIA,
 )
+from feature_engineering import FEATURES, caso_para_linha, eh_payload_v1, v1_para_v2, CAMPOS_V1
 
-# ============================================================================
-# Configuração
-# ============================================================================
-MODEL_PATH = os.environ.get(
-    'MODEL_PATH',
-    str(Path(__file__).parent / 'modelo_ong_prioridade.joblib')
-)
+MODEL_PATH = os.environ.get('MODEL_PATH', str(Path(__file__).parent / 'modelo_ong_prioridade.joblib'))
+VERSAO = 'ml-tdb-v2'
 
-# Mapa de classes — DEVE bater com le_y.classes_ do notebook de treino.
-# LabelEncoder do sklearn ordena alfabeticamente: ['ALTA', 'BAIXA', 'MEDIA']
-# ou seja, 0→ALTA, 1→BAIXA, 2→MEDIA.
-# Se o seu notebook usou outra ordem, ajuste aqui.
-MAPA_CLASSES = {0: 'ALTA', 1: 'BAIXA', 2: 'MEDIA'}
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(message)s'
-)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-# ============================================================================
-# CORS — só aceita origens conhecidas
-# ============================================================================
-# Origens permitidas vêm da variável de ambiente CORS_ALLOWED_ORIGINS
-# (separadas por vírgula). Em dev/local, default permite localhost.
-# Em produção, configure no Render:
-#   CORS_ALLOWED_ORIGINS=https://www.startupados.com.br,https://startupados.com.br
-from flask_cors import CORS
-
 _default_origins = 'http://localhost:5173,http://localhost:3000'
-_origins_env = os.environ.get('CORS_ALLOWED_ORIGINS', _default_origins)
-ALLOWED_ORIGINS = [o.strip() for o in _origins_env.split(',') if o.strip()]
-
-CORS(
-    app,
-    resources={r'/*': {'origins': ALLOWED_ORIGINS}},
-    methods=['GET', 'POST', 'OPTIONS'],
-    allow_headers=['Content-Type'],
-)
+ALLOWED_ORIGINS = [o.strip() for o in os.environ.get('CORS_ALLOWED_ORIGINS', _default_origins).split(',') if o.strip()]
+CORS(app, resources={r'/*': {'origins': ALLOWED_ORIGINS}}, methods=['GET', 'POST', 'OPTIONS'],
+     allow_headers=['Content-Type'])
 logger.info(f'CORS habilitado para origens: {ALLOWED_ORIGINS}')
 
 # ============================================================================
-# Helper — converte numpy → tipos Python nativos (pra jsonify não quebrar)
-# ============================================================================
-def _to_native(obj):
-    """
-    Converte recursivamente numpy.int64/float64/etc. → int/float Python.
-    Flask jsonify não serializa tipos numpy.
-    """
-    if hasattr(obj, 'item') and callable(obj.item):
-        return obj.item()
-    if isinstance(obj, dict):
-        return {_to_native(k): _to_native(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple)):
-        return [_to_native(x) for x in obj]
-    return obj
-
-
-# ============================================================================
-# Carrega o modelo no startup
+# Modelo
 # ============================================================================
 try:
-    logger.info(f'Carregando modelo de {MODEL_PATH}')
-    model = joblib.load(MODEL_PATH)
-    # _to_native garante que classes (que vêm como numpy.int64 do sklearn)
-    # virem ints Python — senão /health quebra na hora de serializar.
-    CLASSES = _to_native(list(getattr(model, 'classes_', [])))
+    _pacote = joblib.load(MODEL_PATH)
+    model = _pacote['modelo']
+    MODEL_FEATURES = _pacote['features']
+    MODEL_CLASSES = [str(c) for c in _pacote['classes']]
+    METRICAS = _pacote.get('metricas', {})
+    if MODEL_FEATURES != FEATURES:
+        raise RuntimeError('As colunas do modelo não batem com feature_engineering.FEATURES — rode treinar.py de novo')
     MODEL_LOADED = True
-    logger.info(f'Modelo carregado. Classes: {CLASSES}')
-except Exception as e:
+    logger.info(f'Modelo {METRICAS.get("versao")} carregado. Classes: {MODEL_CLASSES}')
+except Exception as e:  # noqa: BLE001
     logger.error(f'Falha ao carregar modelo: {e}')
-    model = None
-    CLASSES = []
-    MODEL_LOADED = False
+    model, MODEL_CLASSES, METRICAS, MODEL_LOADED = None, [], {}, False
 
 
 # ============================================================================
-# Handlers globais — sempre retornam JSON, nunca HTML
+# Erros sempre em JSON
 # ============================================================================
 @app.errorhandler(404)
 def not_found(_e):
@@ -124,11 +76,7 @@ def method_not_allowed(_e):
 @app.errorhandler(Exception)
 def handle_unexpected(e):
     logger.error(f'Erro não tratado: {e}\n{traceback.format_exc()}')
-    return jsonify({
-        'error': 'Erro interno do servidor',
-        'type': type(e).__name__,
-        'detail': str(e),
-    }), 500
+    return jsonify({'error': 'Erro interno do servidor', 'type': type(e).__name__}), 500
 
 
 # ============================================================================
@@ -137,33 +85,65 @@ def handle_unexpected(e):
 @app.route('/health', methods=['GET'])
 def health():
     if MODEL_LOADED:
-        return jsonify({
-            'status': 'ok',
-            'model_loaded': True,
-            'classes': CLASSES,
-        }), 200
+        return jsonify({'status': 'ok', 'model_loaded': True, 'versao': VERSAO,
+                        'classes': MODEL_CLASSES, 'metricas': METRICAS}), 200
     return jsonify({'status': 'error', 'model_loaded': False}), 503
+
+
+EXEMPLO_JOVEM = {
+    'programa': 'Dentista do Bem', 'idade': 16, 'sexo': 'masculino',
+    'renda_familiar': 'Ate 1 salario minimo', 'necessidade': 'Tratamento de canal',
+    'texto': 'Sente dor quando mastiga faz duas semanas', 'tempo_espera': 12, 'como_soube': 'Escola',
+}
+EXEMPLO_MULHER = {
+    'programa': 'Apolônias do Bem', 'idade': 42, 'sexo': 'feminino',
+    'necessidade': 'Vitima de violencia com denticao afetada',
+    'texto': 'Perdi dois dentes depois de uma agressão', 'tempo_espera': 3, 'como_soube': 'Delegacia/CREAS',
+}
 
 
 @app.route('/schema', methods=['GET'])
 def schema():
-    """Documenta o contrato da API — útil pro frontend e pra debug."""
     return jsonify({
-        'required_fields': REQUIRED_FIELDS,
-        'vocabulary': VOCAB,
-        'aliases_accepted': ALIASES,
-        'example_request': {
-            'programa': 'apolonas_do_bem',
-            'tempo_espera': 30,
-            'sexo': 'feminino',
-            'idade': 70,
-            'tipo_violencia': 'grave',
-            'vulnerabilidade': 'alta',
-            'dano_dentario': 'grave',
-            'tipo_pedido': 'emergencia',
-            'tipo_tratamento': 'canal',
+        'versao': VERSAO,
+        'obrigatorios': ['idade', 'programa ou sexo'],
+        'campos': {
+            'programa': 'Dentista do Bem | Apolônias do Bem (ou dentista_do_bem / apolonias_do_bem)',
+            'idade': 'inteiro, anos',
+            'sexo': 'feminino | masculino',
+            'renda_familiar': f'texto do formulário ("Ate 1 salario minimo"...) ou {RENDAS}',
+            'necessidade': f'texto do formulário ("Tratamento de canal"...) ou {NECESSIDADES}',
+            'vitima_violencia': f'{VITIMA} (opcional; o formulário das Apolônias já manda na necessidade)',
+            'texto': 'descrição/observações livres do paciente — sintomas, violência e impacto são lidos daqui',
+            'sintoma': f'{SINTOMAS} (opcional; o texto também é lido)',
+            'tempo_espera': 'inteiro, dias desde a solicitação',
+            'como_soube': 'texto do formulário ("Delegacia/CREAS", "Posto de saude", "Escola"...)',
         },
+        'faixas': {'ALTA': f'>= {LIMIAR_ALTA} pontos ou regra crítica',
+                   'MEDIA': f'{LIMIAR_MEDIA}-{LIMIAR_ALTA - 1}', 'BAIXA': f'< {LIMIAR_MEDIA}'},
+        'payload_v1_aceito': CAMPOS_V1,
+        'example_request': EXEMPLO_JOVEM,
+        'exemplo_apolonias': EXEMPLO_MULHER,
     }), 200
+
+
+def _validar(payload: dict):
+    if payload.get('idade') in (None, ''):
+        return 'Campo obrigatório faltando: idade'
+    try:
+        idade = int(payload['idade'])
+    except (TypeError, ValueError):
+        return 'idade deve ser um inteiro'
+    if not 0 < idade < 120:
+        return 'idade fora do intervalo esperado'
+    try:
+        if int(payload.get('tempo_espera') or 0) < 0:
+            return 'tempo_espera não pode ser negativo'
+    except (TypeError, ValueError):
+        return 'tempo_espera deve ser um inteiro (dias)'
+    if not payload.get('programa') and not payload.get('sexo'):
+        return 'Informe programa ou sexo'
+    return None
 
 
 @app.route('/predict', methods=['POST'])
@@ -171,87 +151,53 @@ def predict():
     if not MODEL_LOADED:
         return jsonify({'error': 'Modelo não disponível'}), 503
 
-    # 1. Parse JSON
-    try:
-        payload = request.get_json(force=True, silent=False)
-    except Exception as e:
-        return jsonify({'error': 'JSON inválido', 'detail': str(e)}), 400
-
+    payload = request.get_json(force=True, silent=True)
     if not isinstance(payload, dict):
         return jsonify({'error': 'Payload deve ser um objeto JSON'}), 400
 
-    # 2. Normaliza aliases (F → feminino, urgente → emergencia, etc.)
-    payload = normalize_input(payload)
+    formato = 'v1' if eh_payload_v1(payload) else 'v2'
+    if formato == 'v1':
+        payload = v1_para_v2(payload)
 
-    # 3. Valida campos obrigatórios
-    faltando = [f for f in REQUIRED_FIELDS if f not in payload]
-    if faltando:
-        return jsonify({
-            'error': 'Campos obrigatórios faltando',
-            'missing': faltando,
-            'required_fields': REQUIRED_FIELDS,
-        }), 400
+    erro = _validar(payload)
+    if erro:
+        return jsonify({'error': erro}), 400
 
-    # 4. Valida vocabulário das categóricas
-    invalid = {}
-    for campo, valores_validos in VOCAB.items():
-        if payload[campo] not in valores_validos:
-            invalid[campo] = {
-                'received': payload[campo],
-                'allowed': valores_validos,
-            }
-    if invalid:
-        return jsonify({
-            'error': 'Valores inválidos',
-            'invalid': invalid,
-        }), 400
+    caso = montar_caso(payload)
+    criterio = avaliar(caso)
 
-    # 5. Valida tipos numéricos
-    try:
-        payload['idade'] = int(payload['idade'])
-        payload['tempo_espera'] = int(payload['tempo_espera'])
-    except (ValueError, TypeError):
-        return jsonify({
-            'error': 'idade e tempo_espera devem ser inteiros',
-        }), 400
+    df = pd.DataFrame([caso_para_linha(caso, regra_critica=criterio.regra_critica is not None)], columns=FEATURES)
+    proba = model.predict_proba(df)[0]
+    probabilidades = {c: round(float(p), 4) for c, p in zip(MODEL_CLASSES, proba)}
+    pred_modelo = max(probabilidades, key=probabilidades.get)
 
-    # 6. Monta DataFrame APENAS com os 9 campos brutos
-    df = pd.DataFrame([{f: payload[f] for f in REQUIRED_FIELDS}])
+    if criterio.regra_critica:
+        prediction, origem = 'ALTA', 'regra_critica'
+    else:
+        prediction, origem = pred_modelo, 'modelo'
+        fora = any('elegibilidade' in a for a in criterio.alertas)
+        if fora and prediction == 'ALTA' and not caso.urgencia:
+            prediction, origem = 'MEDIA', 'modelo_limitado_por_elegibilidade'
 
-    # 7. Feature engineering server-side (gera as 12 features derivadas)
-    try:
-        df_full = add_business_features(df)
-    except Exception as e:
-        logger.exception('Erro na feature engineering')
-        return jsonify({
-            'error': 'Erro na feature engineering',
-            'detail': str(e),
-        }), 500
+    entrada = asdict(caso)
+    entrada.pop('termo_sintoma', None)
 
-    # 8. Predição
-    try:
-        pred_int = int(model.predict(df_full)[0])
-        pred_label = MAPA_CLASSES.get(pred_int, str(pred_int))
-        result = {'prediction': pred_label}
-
-        # Se o modelo expõe probabilidades, devolve junto — útil pra confiança
-        if hasattr(model, 'predict_proba'):
-            proba = model.predict_proba(df_full)[0]
-            result['probabilities'] = {
-                MAPA_CLASSES.get(int(cls), str(cls)): round(float(p), 4)
-                for cls, p in zip(CLASSES, proba)
-            }
-        # _to_native blinda contra qualquer numpy type residual
-        return jsonify(_to_native(result)), 200
-    except Exception as e:
-        logger.exception('Erro na predição')
-        return jsonify({
-            'error': 'Erro na predição',
-            'detail': str(e),
-        }), 500
+    return jsonify({
+        'prediction': prediction,
+        'probabilities': {k: probabilidades.get(k, 0.0) for k in ('ALTA', 'MEDIA', 'BAIXA')},
+        'confianca': probabilidades.get(prediction, 0.0),
+        'origem': origem,
+        'pontuacao': criterio.pontos,
+        'prioridade_criterio': criterio.prioridade,
+        'regra_critica': criterio.regra_critica,
+        'fatores': [{'fator': f, 'pontos': p} for f, p in criterio.fatores],
+        'alertas': criterio.alertas,
+        'entrada_interpretada': entrada,
+        'formato_entrada': formato,
+        'modelo_versao': VERSAO,
+    }), 200
 
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
-    logger.info(f'Servidor iniciando na porta {port}')
     app.run(host='0.0.0.0', port=port, debug=False)
